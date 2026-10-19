@@ -259,6 +259,8 @@ pub enum Role {
     Rider,
     /// Hospital staff - can mark units as Delivered
     Hospital,
+    /// No role assigned (default for unknown addresses) - cannot transition any unit
+    Unprivileged,
 }
 
 /// Storage key types for efficient querying
@@ -297,6 +299,9 @@ pub enum DataKey {
     BloodTypeIndexPage(BloodType, u32),
     StatusIndexPage(BloodStatus, u32),
 
+    /// Position of a blood unit inside its status index: blood_unit_id -> (page, slot)
+    StatusIndexSlot(u64),
+
     /// Authorized blood bank address
     AuthorizedBank(Address),
 
@@ -324,6 +329,12 @@ pub enum DataKey {
     /// Reservation counter
     ReservationCounter,
 
+    /// Rider assigned by the owning bank to move a unit (blood_unit_id -> Address)
+    UnitRider(u64),
+
+    /// Hospital assigned by the owning bank as the destination of a unit (blood_unit_id -> Address)
+    UnitHospital(u64),
+
     /// Circuit breaker: contract is paused
     Paused,
 
@@ -333,6 +344,11 @@ pub enum DataKey {
     /// Address of the authoritative HealthChainContract (BloodUnitRegistry)
     /// for cross-contract state synchronisation.
     RegistryContractId,
+
+    /// Address of the trusted requests contract that is allowed to call
+    /// `release_reservation_by_contract`. Only this address is permitted;
+    /// any other address is rejected regardless of `require_auth`.
+    RequestsContractId,
 }
 
 /// Reservation record for blood units locked for a specific requester

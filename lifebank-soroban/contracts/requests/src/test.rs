@@ -4,9 +4,25 @@ use crate::{
     RequestStatus, Urgency,
 };
 use soroban_sdk::{
+    contract, contractimpl,
     testutils::{Address as _, Events as _, Ledger as _},
     Address, Env, String,
 };
+
+/// Minimal inventory mock so cross-contract release calls don't panic.
+#[contract]
+struct MockInventory;
+
+#[contractimpl]
+impl MockInventory {
+    pub fn release_reservation(_env: Env, _caller: Address, _reservation_id: u64) {}
+    pub fn release_reservation_by_contract(
+        _env: Env,
+        _authorized_contract: Address,
+        _reservation_id: u64,
+    ) {
+    }
+}
 
 fn create_uninitialized_contract<'a>() -> (Env, RequestContractClient<'a>, Address) {
     let env = Env::default();
@@ -22,7 +38,7 @@ fn create_initialized_contract<'a>() -> (Env, RequestContractClient<'a>, Address
 {
     let (env, client, contract_id) = create_uninitialized_contract();
     let admin = Address::generate(&env);
-    let inventory_contract = Address::generate(&env);
+    let inventory_contract = env.register(MockInventory, ());
     client.initialize(&admin, &inventory_contract);
     (env, client, contract_id, admin, inventory_contract)
 }
@@ -417,5 +433,5 @@ fn test_cancel_request_with_reservation_id() {
 
     let history = client.get_request_history(&request_id);
     let cancel_entry = history.get(3).unwrap();
-    assert_eq!(cancel_entry.released_reservation, true);
+    assert!(cancel_entry.released_reservation);
 }

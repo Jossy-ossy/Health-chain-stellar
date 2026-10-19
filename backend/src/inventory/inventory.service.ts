@@ -1,5 +1,6 @@
 import {
   ConflictException,
+  ForbiddenException,
   Injectable,
   Logger,
   NotFoundException,
@@ -24,6 +25,10 @@ import {
 import { InventoryStockEntity } from './entities/inventory-stock.entity';
 import { InventoryRepository } from './repositories/inventory.repository';
 import { InventoryStockRepository } from './repositories/inventory-stock.repository';
+import { CreateInventoryDto } from './dto/create-inventory.dto';
+import { UpdateInventoryDto } from './dto/update-inventory.dto';
+
+import { BloodComponent } from '../blood-units/enums/blood-component.enum';
 
 export interface ReserveOptions {
   /** Urgency for priority tie-breaking: CRITICAL > URGENT > ROUTINE > SCHEDULED */
@@ -38,7 +43,6 @@ export class InventoryService {
   constructor(
     @InjectRepository(InventoryStockEntity)
     private readonly inventoryRepo: Repository<InventoryStockEntity>,
-    private readonly unitInvariant: ReservedUnitInvariantService,
     private readonly customInventoryRepo: InventoryRepository,
     private readonly stockRepo: InventoryStockRepository,
     @InjectRepository(ReservationAuditEntity)
@@ -63,58 +67,60 @@ export class InventoryService {
     return PaginationUtil.createResponse(data, page, pageSize, totalCount);
   }
 
-  async findOne(id: string) {
-    const item = await this.stockRepo.findById(id);
+  async findOne(id: string, bloodBankId: string) {
+    const item = await this.stockRepo.findById(id, bloodBankId);
     if (!item) throw new NotFoundException(`Inventory item '${id}' not found`);
     return { message: 'Inventory item retrieved successfully', data: item };
   }
 
-  async create(dto: any) {
+  async create(dto: CreateInventoryDto, bloodBankId: string) {
+    if (!bloodBankId || dto.hospitalId !== bloodBankId) {
+      throw new ForbiddenException(
+        'You can only manage inventory for your organization.',
+      );
+    }
+    const component = BloodComponent.WHOLE_BLOOD;
     const existing = await this.stockRepo.findByBankAndType(
-      dto.bloodBankId,
+      bloodBankId,
       dto.bloodType,
+      component,
     );
-    const units = Number(
-      dto.availableUnits ?? dto.availableUnitsMl ?? dto.quantity ?? 0,
-    );
+    const units = Number(dto.quantity);
     const entity = existing
       ? this.stockRepo.merge(existing, { availableUnitsMl: units })
       : this.stockRepo.create({
-          bloodBankId: dto.bloodBankId,
+          bloodBankId,
           bloodType: dto.bloodType,
+          component,
           availableUnitsMl: units,
         });
     const data = await this.stockRepo.save(entity);
     return { message: 'Inventory item created successfully', data };
   }
 
-  async update(id: string, dto: any) {
-    const existing = await this.stockRepo.findById(id);
+  async update(id: string, dto: UpdateInventoryDto, bloodBankId: string) {
+    const existing = await this.stockRepo.findById(id, bloodBankId);
     if (!existing)
       throw new NotFoundException(`Inventory item '${id}' not found`);
-    const units =
-      dto.availableUnits !== undefined
-        ? Number(dto.availableUnits)
-        : dto.availableUnitsMl !== undefined
-          ? Number(dto.availableUnitsMl)
-          : existing.availableUnitsMl;
     const updated = this.stockRepo.merge(existing, {
-      ...dto,
-      availableUnitsMl: units,
+      availableUnitsMl:
+        dto.quantity !== undefined
+          ? Number(dto.quantity)
+          : existing.availableUnitsMl,
     });
     const data = await this.stockRepo.save(updated);
     return { message: 'Inventory item updated successfully', data };
   }
 
-  async remove(id: string) {
-    const item = await this.stockRepo.findById(id);
+  async remove(id: string, bloodBankId: string) {
+    const item = await this.stockRepo.findById(id, bloodBankId);
     if (!item) throw new NotFoundException(`Inventory item '${id}' not found`);
     await this.stockRepo.remove(item);
     return { message: 'Inventory item deleted successfully', data: { id } };
   }
 
-  async updateStock(id: string, quantity: number) {
-    const existing = await this.stockRepo.findById(id);
+  async updateStock(id: string, quantity: number, bloodBankId: string) {
+    const existing = await this.stockRepo.findById(id, bloodBankId);
     if (!existing)
       throw new NotFoundException(`Inventory item '${id}' not found`);
     existing.availableUnitsMl = Number(quantity);
@@ -135,8 +141,9 @@ export class InventoryService {
   findByBankAndBloodType(
     bloodBankId: string,
     bloodType: string,
+    component: BloodComponent | string = BloodComponent.WHOLE_BLOOD,
   ): Promise<InventoryStockEntity | null> {
-    return this.stockRepo.findByBankAndType(bloodBankId, bloodType);
+    return this.stockRepo.findByBankAndType(bloodBankId, bloodType, component);
   }
 
   async reserveStockOrThrow(
@@ -144,6 +151,7 @@ export class InventoryService {
     bloodType: string,
     quantity: number,
     opts?: ReserveOptions,
+    component: BloodComponent | string = BloodComponent.WHOLE_BLOOD,
   ): Promise<void> {
     if (quantity <= 0) {
       throw new ConflictException(
@@ -154,15 +162,16 @@ export class InventoryService {
       const stock = await this.stockRepo.findByBankAndType(
         bloodBankId,
         bloodType,
+        component,
       );
       if (!stock) {
         throw new ConflictException(
-          `No inventory found for blood type ${bloodType} at blood bank ${bloodBankId}.`,
+          `No inventory found for blood type ${bloodType} (${component}) at blood bank ${bloodBankId}.`,
         );
       }
       if (stock.availableUnitsMl < quantity) {
         throw new ConflictException(
-          `Insufficient stock for ${bloodType} at blood bank ${bloodBankId}. Available: ${stock.availableUnitsMl}, requested: ${quantity}.`,
+          `Insufficient stock for ${bloodType} (${component}) at blood bank ${bloodBankId}. Available: ${stock.availableUnitsMl}, requested: ${quantity}.`,
         );
       }
       const result = await this.stockRepo.atomicDecrement(
@@ -194,6 +203,7 @@ export class InventoryService {
     bloodBankId: string,
     bloodType: string,
     quantity: number,
+    component: BloodComponent | string = BloodComponent.WHOLE_BLOOD,
   ): Promise<void> {
     if (quantity <= 0) {
       throw new ConflictException(
@@ -204,11 +214,13 @@ export class InventoryService {
       const stock = await this.stockRepo.findByBankAndType(
         bloodBankId,
         bloodType,
+        component,
       );
       if (!stock) {
         const created = this.stockRepo.create({
           bloodBankId,
-          bloodType,
+          bloodType: bloodType as any,
+          component: component as any,
           availableUnitsMl: quantity,
         });
         await this.stockRepo.save(created);
@@ -231,14 +243,16 @@ export class InventoryService {
     bloodBankId: string,
     bloodType: string,
     _quantity: number,
+    component: BloodComponent | string = BloodComponent.WHOLE_BLOOD,
   ): Promise<void> {
     const stock = await this.stockRepo.findByBankAndType(
       bloodBankId,
       bloodType,
+      component,
     );
     if (!stock) {
       throw new ConflictException(
-        `No inventory found for blood type ${bloodType} at blood bank ${bloodBankId}.`,
+        `No inventory found for blood type ${bloodType} (${component}) at blood bank ${bloodBankId}.`,
       );
     }
     await this.stockRepo.bumpVersion(stock.id);
@@ -248,8 +262,9 @@ export class InventoryService {
     bloodBankId: string,
     bloodType: string,
     quantity: number,
+    component: BloodComponent | string = BloodComponent.WHOLE_BLOOD,
   ): Promise<void> {
-    return this.restoreStockOrThrow(bloodBankId, bloodType, quantity);
+    return this.restoreStockOrThrow(bloodBankId, bloodType, quantity, component);
   }
 
   // ── Expiration auto-release ──────────────────────────────────────────
@@ -268,33 +283,60 @@ export class InventoryService {
 
     for (const res of expired) {
       try {
-        // Mark expired first to prevent double-release
-        const result = await this.reservationRepo
-          .createQueryBuilder()
-          .update(BloodRequestReservationEntity)
-          .set({ status: ReservationStatus.EXPIRED })
-          .where('id = :id', { id: res.id })
-          .andWhere('status = :status', { status: ReservationStatus.RESERVED })
-          .execute();
+        await this.reservationRepo.manager.transaction(async (manager) => {
+          // Mark expired first to prevent double-release
+          const result = await manager
+            .createQueryBuilder()
+            .update(BloodRequestReservationEntity)
+            .set({ status: ReservationStatus.EXPIRED })
+            .where('id = :id', { id: res.id })
+            .andWhere('status = :status', { status: ReservationStatus.RESERVED })
+            .execute();
 
-        if (!result.affected) continue; // already handled by another worker
+          if (!result.affected) return; // already handled by another worker
 
-        await this.restoreStockOrThrow(
-          res.bloodBankId,
-          res.bloodType,
-          res.quantityMl,
-        );
+          // Restore stock
+          const bloodType = (res as any).bloodType;
+          const component = BloodComponent.WHOLE_BLOOD;
+          let stock = await manager.findOne(InventoryStockEntity, {
+            where: {
+              bloodBankId: res.bloodBankId,
+              bloodType: bloodType,
+              component: component as any,
+            },
+          });
 
-        await this.auditRepo.save(
-          this.auditRepo.create({
-            requestId: res.requestId,
-            bloodBankId: res.bloodBankId,
-            bloodType: res.bloodType,
-            quantityMl: res.quantityMl,
-            action: ReservationAuditAction.EXPIRED_RELEASED,
-            notes: `Reservation ${res.id} expired at ${res.expiresAt}`,
-          }),
-        );
+          if (!stock) {
+            const created = manager.create(InventoryStockEntity, {
+              bloodBankId: res.bloodBankId,
+              bloodType: bloodType,
+              component: component as any,
+              availableUnitsMl: res.quantityMl,
+            });
+            await manager.save(created);
+          } else {
+            await manager
+              .createQueryBuilder()
+              .update(InventoryStockEntity)
+              .set({
+                availableUnitsMl: () => `"available_units_ml" + ${res.quantityMl}`,
+                version: () => '"version" + 1',
+              })
+              .where('id = :id', { id: stock.id })
+              .execute();
+          }
+
+          await manager.save(
+            manager.create(ReservationAuditEntity, {
+              requestId: res.requestId,
+              bloodBankId: res.bloodBankId,
+              bloodType: bloodType,
+              quantityMl: res.quantityMl,
+              action: ReservationAuditAction.EXPIRED_RELEASED,
+              notes: `Reservation ${res.id} expired at ${res.expiresAt}`,
+            }),
+          );
+        });
 
         this.logger.log(
           `Released expired reservation ${res.id} requestId=${res.requestId}`,

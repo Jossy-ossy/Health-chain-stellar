@@ -1,10 +1,23 @@
 use crate::types::{BloodRequest, RequestCreatedEvent, RequestStatus};
 use soroban_sdk::{contractevent, Address, Env};
 
+#[contractevent(topics = ["fulfilling_org_set"], data_format = "vec")]
+pub struct FulfillingOrgSet {
+    pub request_id: u64,
+    pub actor: Address,
+    pub org_id: Address,
+    pub timestamp: u64,
+}
+
 #[contractevent(topics = ["initialized"], data_format = "vec")]
 pub struct RequestsInitialized {
     pub admin: Address,
     pub inventory_contract: Address,
+}
+
+#[contractevent(topics = ["payments_contract_set"], data_format = "single-value")]
+pub struct PaymentsContractSet {
+    pub payments_contract: Address,
 }
 
 #[contractevent(topics = ["request_cancelled"], data_format = "vec")]
@@ -51,6 +64,13 @@ pub fn emit_request_created(env: &Env, request: &BloodRequest) {
     .publish(env);
 }
 
+pub fn emit_payments_contract_set(env: &Env, payments_contract: &Address) {
+    PaymentsContractSet {
+        payments_contract: payments_contract.clone(),
+    }
+    .publish(env);
+}
+
 pub fn emit_request_cancelled(env: &Env, request_id: u64, actor: &Address, timestamp: u64) {
     RequestCancelled {
         request_id,
@@ -89,6 +109,22 @@ pub fn emit_reservation_id_set(
         request_id,
         actor: actor.clone(),
         reservation_id,
+        timestamp,
+    }
+    .publish(env);
+}
+
+pub fn emit_fulfilling_org_set(
+    env: &Env,
+    request_id: u64,
+    actor: &Address,
+    org_id: &Address,
+    timestamp: u64,
+) {
+    FulfillingOrgSet {
+        request_id,
+        actor: actor.clone(),
+        org_id: org_id.clone(),
         timestamp,
     }
     .publish(env);

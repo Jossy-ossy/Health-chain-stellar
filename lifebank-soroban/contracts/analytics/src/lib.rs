@@ -59,13 +59,33 @@ const THIRTY_DAY_WINDOW_SECS: u64 = 2_592_000; // 30 days
 const SNAPSHOT_TTL_MIN: u32 = 290_000;
 const SNAPSHOT_TTL_MAX: u32 = 6_307_200;
 
+// TTL constants for the instance-storage entry that holds AnalyticsConfig
+// (in ledgers; ~5 s each). Mirrors the PERSISTENT_BUMP_THRESHOLD /
+// PERSISTENT_BUMP_TO pair used by the payments contract so both contracts
+// share one bump policy.
+const INSTANCE_BUMP_THRESHOLD: u32 = 518_400; // ~30 days
+const INSTANCE_BUMP_TO: u32 = 1_036_800; // ~60 days
+
 // ── Storage helpers ───────────────────────────────────────────────────────────
 
-fn require_initialized(env: &Env) -> Result<AnalyticsConfig, AnalyticsError> {
+/// Extend instance-storage TTL using the same threshold/extend-to as persistent
+/// writes. Instance storage holds the config key; without an explicit bump the
+/// entire contract instance can be archived, which makes every function that
+/// reads config fail even though the contract was correctly initialized.
+fn extend_instance_ttl(env: &Env) {
     env.storage()
         .instance()
+        .extend_ttl(INSTANCE_BUMP_THRESHOLD, INSTANCE_BUMP_TO);
+}
+
+fn require_initialized(env: &Env) -> Result<AnalyticsConfig, AnalyticsError> {
+    let config = env
+        .storage()
+        .instance()
         .get(&DataKey::Config)
-        .ok_or(AnalyticsError::NotInitialized)
+        .ok_or(AnalyticsError::NotInitialized)?;
+    extend_instance_ttl(env);
+    Ok(config)
 }
 
 fn require_admin(env: &Env) -> Result<AnalyticsConfig, AnalyticsError> {
@@ -129,6 +149,29 @@ fn set_counter_i128(env: &Env, key: &DataKey, value: i128) {
         .extend_ttl(key, SNAPSHOT_TTL_MIN, SNAPSHOT_TTL_MAX);
 }
 
+/// Read the timestamp of the last actual metric write.
+///
+/// Returns 0 when no metric has ever been recorded, so callers can
+/// distinguish "never updated" from a genuine ingestion timestamp.
+fn get_last_updated(env: &Env) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::LastUpdated)
+        .unwrap_or(0u64)
+}
+
+/// Persist the timestamp of the last actual metric write.
+fn set_last_updated(env: &Env, timestamp: u64) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::LastUpdated, &timestamp);
+    env.storage().persistent().extend_ttl(
+        &DataKey::LastUpdated,
+        SNAPSHOT_TTL_MIN,
+        SNAPSHOT_TTL_MAX,
+    );
+}
+
 // ── Contract ──────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -171,6 +214,7 @@ impl AnalyticsContract {
         };
 
         env.storage().instance().set(&DataKey::Config, &config);
+        extend_instance_ttl(&env);
 
         // Initialize lifetime counters to zero in persistent storage.
         set_counter_u64(&env, &DataKey::TotalDonations, 0u64);
@@ -178,6 +222,9 @@ impl AnalyticsContract {
         set_counter_u64(&env, &DataKey::TotalDeliveries, 0u64);
         set_counter_u64(&env, &DataKey::TotalPaymentsReleased, 0u64);
         set_counter_i128(&env, &DataKey::TotalVolume, 0i128);
+        set_last_updated(&env, 0u64);
+
+        // No metric has been recorded yet; last_updated starts at 0.
 
         AnalyticsInitialized { admin }.publish(&env);
 
@@ -208,6 +255,7 @@ impl AnalyticsContract {
         };
 
         env.storage().instance().set(&DataKey::Config, &cfg);
+        extend_instance_ttl(&env);
 
         ReportingPeriodUpdated {
             period_type,
@@ -231,6 +279,7 @@ impl AnalyticsContract {
 
         let total = get_counter_u64(&env, &DataKey::TotalDonations) + 1;
         set_counter_u64(&env, &DataKey::TotalDonations, total);
+        set_last_updated(&env, snap.last_updated);
 
         DonationRecorded {
             total_donations: total,
@@ -251,6 +300,7 @@ impl AnalyticsContract {
 
         let total = get_counter_u64(&env, &DataKey::TotalRequests) + 1;
         set_counter_u64(&env, &DataKey::TotalRequests, total);
+        set_last_updated(&env, snap.last_updated);
 
         RequestRecorded {
             total_requests: total,
@@ -271,6 +321,7 @@ impl AnalyticsContract {
 
         let total = get_counter_u64(&env, &DataKey::TotalDeliveries) + 1;
         set_counter_u64(&env, &DataKey::TotalDeliveries, total);
+        set_last_updated(&env, snap.last_updated);
 
         DeliveryRecorded {
             total_deliveries: total,
@@ -296,6 +347,7 @@ impl AnalyticsContract {
 
         let total_payments = get_counter_u64(&env, &DataKey::TotalPaymentsReleased) + 1;
         set_counter_u64(&env, &DataKey::TotalPaymentsReleased, total_payments);
+        set_last_updated(&env, snap.last_updated);
 
         let total_volume = get_counter_i128(&env, &DataKey::TotalVolume).saturating_add(amount);
         set_counter_i128(&env, &DataKey::TotalVolume, total_volume);
@@ -342,7 +394,7 @@ impl AnalyticsContract {
             total_deliveries: get_counter_u64(&env, &DataKey::TotalDeliveries),
             total_payments_released: get_counter_u64(&env, &DataKey::TotalPaymentsReleased),
             total_volume: get_counter_i128(&env, &DataKey::TotalVolume),
-            last_updated: env.ledger().timestamp(),
+            last_updated: get_last_updated(&env),
         })
     }
 
@@ -352,6 +404,7 @@ impl AnalyticsContract {
     }
 
     pub fn is_initialized(env: Env) -> bool {
+        extend_instance_ttl(&env);
         env.storage().instance().has(&DataKey::Config)
     }
 }

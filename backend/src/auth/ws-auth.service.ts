@@ -15,8 +15,13 @@ import Redis from 'ioredis';
 import { Inject } from '@nestjs/common';
 
 import { REDIS_CLIENT } from '../redis/redis.constants';
-import { SecurityEventLoggerService } from '../user-activity/security-event-logger.service';
+import {
+  SecurityEventLoggerService,
+  SecurityEventType,
+} from '../user-activity/security-event-logger.service';
 import { JwtKeyService } from './jwt-key.service';
+import { MFA_TOKEN_AUDIENCE } from './mfa/mfa.constants';
+import { SessionStatusService } from './session-status.service';
 
 /**
  * Authenticated socket with user context attached
@@ -24,7 +29,8 @@ import { JwtKeyService } from './jwt-key.service';
 export interface AuthenticatedSocket extends Socket {
   user?: {
     userId: string;
-    tenantId: string;
+    tenantId?: string | null;
+    organizationId?: string | null;
     email?: string;
     role?: string;
     roles?: string[];
@@ -36,7 +42,8 @@ export interface AuthenticatedSocket extends Socket {
   };
   data: {
     userId?: string;
-    tenantId?: string;
+    tenantId?: string | null;
+    organizationId?: string | null;
     role?: string;
     hospitalIds?: string[];
   };
@@ -75,6 +82,7 @@ export class WsAuthService {
     private readonly jwtKeyService: JwtKeyService,
     @Inject(REDIS_CLIENT) private readonly redis: Redis,
     private readonly securityEventLogger: SecurityEventLoggerService,
+    private readonly sessionStatusService: SessionStatusService,
   ) {}
 
   /**
@@ -103,7 +111,7 @@ export class WsAuthService {
 
         if (!token) {
           const err = new Error('Authentication token required');
-          await this.auditEvent('WS_NO_TOKEN', {
+          await this.auditEvent(SecurityEventType.WS_NO_TOKEN, {
             socketId: socket.id,
             ip: socket.handshake.address,
             userAgent: socket.handshake.headers['user-agent'],
@@ -120,7 +128,7 @@ export class WsAuthService {
           decoded = await this.verifyToken(token);
         } catch (error) {
           const err = new Error(`Invalid or expired token: ${(error as Error).message}`);
-          await this.auditEvent('WS_INVALID_TOKEN', {
+          await this.auditEvent(SecurityEventType.WS_INVALID_TOKEN, {
             socketId: socket.id,
             ip: socket.handshake.address,
             error: (error as Error).message,
@@ -132,13 +140,15 @@ export class WsAuthService {
         // ─────────────────────────────────────────────────────────────────────
         // 3. VALIDATE CLAIMS STRUCTURE
         // ─────────────────────────────────────────────────────────────────────
-        if (!decoded.userId || !decoded.tenantId) {
+        const requiresTenant = !this.isOrgLessRole(decoded.role);
+        if (!decoded.userId || (!decoded.tenantId && requiresTenant)) {
           const err = new Error('Invalid token claims: missing userId or tenantId');
-          await this.auditEvent('WS_INVALID_CLAIMS', {
+          await this.auditEvent(SecurityEventType.WS_INVALID_CLAIMS, {
             socketId: socket.id,
             ip: socket.handshake.address,
             userId: decoded.userId,
-            tenantId: decoded.tenantId,
+            tenantId: decoded.tenantId ?? null,
+            role: decoded.role,
           });
           return next(err);
         }
@@ -156,7 +166,7 @@ export class WsAuthService {
 
           if (!rateLimitOk) {
             const err = new Error('Rate limit exceeded: too many connections');
-            await this.auditEvent('WS_RATE_LIMITED', {
+            await this.auditEvent(SecurityEventType.WS_RATE_LIMITED, {
               socketId: socket.id,
               userId: decoded.userId,
               ip: socket.handshake.address,
@@ -172,18 +182,19 @@ export class WsAuthService {
 
         // Also attach to socket.data for compatibility with existing gateway code
         socket.data.userId = decoded.userId;
-        socket.data.tenantId = decoded.tenantId;
+        socket.data.tenantId = decoded.tenantId ?? null;
+        socket.data.organizationId = decoded.organizationId ?? null;
         socket.data.role = decoded.role;
 
         // Log successful authentication
         this.logger.log(
-          `WS authenticated: socketId=${socket.id} userId=${decoded.userId} tenantId=${decoded.tenantId} role=${decoded.role}`,
+          `WS authenticated: socketId=${socket.id} userId=${decoded.userId} tenantId=${decoded.tenantId ?? 'none'} role=${decoded.role}`,
         );
 
-        await this.auditEvent('WS_AUTH_SUCCESS', {
+        await this.auditEvent(SecurityEventType.WS_AUTH_SUCCESS, {
           socketId: socket.id,
           userId: decoded.userId,
-          tenantId: decoded.tenantId,
+          tenantId: decoded.tenantId ?? null,
           role: decoded.role,
           ip: socket.handshake.address,
         });
@@ -196,7 +207,7 @@ export class WsAuthService {
         );
 
         const err = new Error('Authentication failed');
-        await this.auditEvent('WS_AUTH_ERROR', {
+        await this.auditEvent(SecurityEventType.WS_AUTH_ERROR, {
           socketId: socket.id,
           ip: socket.handshake.address,
           error: (error as Error).message,
@@ -267,10 +278,24 @@ export class WsAuthService {
       throw new Error('Token expired');
     }
 
+    // MFA challenge tokens are not access tokens
+    const aud = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
+    if (payload.purpose === 'mfa' || aud.includes(MFA_TOKEN_AUDIENCE)) {
+      throw new Error('Invalid access token');
+    }
+
+    // Reject tokens whose session was logged out or revoked (HTTP parity)
+    if (!(await this.sessionStatusService.isSessionActive(payload.sid))) {
+      throw new Error('Session has been revoked');
+    }
+
+    const tenantId = payload.organizationId ?? payload.hospitalId ?? payload.tenantId ?? null;
+
     // Map HTTP JWT claims to WS user object
     return {
       userId: payload.sub || payload.userId,
-      tenantId: payload.hospitalId || payload.tenantId,
+      tenantId,
+      organizationId: payload.organizationId ?? null,
       email: payload.email,
       role: payload.role,
       roles: payload.roles || (payload.role ? [payload.role] : []),
@@ -280,6 +305,14 @@ export class WsAuthService {
       sid: payload.sid,
       keyid: kid,
     };
+  }
+
+  private isOrgLessRole(role?: string): boolean {
+    if (!role) {
+      return false;
+    }
+
+    return ['donor', 'rider'].includes(role.toLowerCase());
   }
 
   /**
@@ -339,27 +372,12 @@ export class WsAuthService {
    * All authentication and privilege violations are recorded for compliance.
    */
   private async auditEvent(
-    eventType: string,
+    eventType: SecurityEventType,
     metadata: Record<string, any>,
   ): Promise<void> {
     try {
-      // Map to SecurityEventType if exists
-      const eventMap: Record<string, string> = {
-        WS_NO_TOKEN: 'WS_NO_TOKEN',
-        WS_INVALID_TOKEN: 'WS_INVALID_TOKEN',
-        WS_INVALID_CLAIMS: 'WS_INVALID_CLAIMS',
-        WS_PRIVILEGE_VIOLATION: 'WS_PRIVILEGE_VIOLATION',
-        WS_TENANT_ESCAPE_ATTEMPT: 'WS_TENANT_ESCAPE_ATTEMPT',
-        WS_RATE_LIMITED: 'WS_RATE_LIMITED',
-        WS_AUTH_SUCCESS: 'WS_AUTH_SUCCESS',
-        WS_AUTH_ERROR: 'WS_AUTH_ERROR',
-        WS_TOKEN_REFRESH_FAILED: 'WS_TOKEN_REFRESH_FAILED',
-      };
-
-      const finalEventType = eventMap[eventType] || eventType;
-
       await this.securityEventLogger.logEvent({
-        eventType: finalEventType as any,
+        eventType,
         userId: metadata.userId || null,
         metadata,
         ipAddress: metadata.ip,

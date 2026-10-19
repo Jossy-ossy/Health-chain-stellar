@@ -96,6 +96,27 @@ pub struct BloodRequest {
     pub status: RequestStatus,
     pub assigned_units: Vec<u64>,
     pub fulfilled_quantity_ml: u32,
+    /// Reservation ID on the inventory contract, set when units are reserved.
+    pub reservation_id: Option<u64>,
+    /// Organization (blood bank) that fulfilled this request, if any.
+    pub fulfilled_by: Option<Address>,
+    /// Request lifecycle transitions.
+    pub history: Vec<RequestHistoryEntry>,
+}
+
+/// Mirrors `request_contract::types::RequestHistoryEntry`. A struct is decoded
+/// field-for-field, so BloodRequest cannot be read without this exact shape.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RequestHistoryEntry {
+    pub previous_status: RequestStatus,
+    pub is_initial_transition: bool,
+    pub new_status: RequestStatus,
+    pub actor: Address,
+    pub reason: String,
+    pub fulfilled_delta_ml: u32,
+    pub released_reservation: bool,
+    pub timestamp: u64,
 }
 
 /// Request status — mirrors requests contract's `RequestStatus`.

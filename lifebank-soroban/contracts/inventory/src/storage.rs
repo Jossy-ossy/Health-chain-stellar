@@ -20,6 +20,27 @@ pub const LEDGER_CLOSE_SECS: u64 = 5;
 /// a few ledgers after creation and is readable in the same ledger batch.
 pub const RESERVATION_TTL_MIN_LEDGERS: u32 = 60; // ~5 minutes
 
+/// Grace period (ledgers) a reservation stays in storage after its expiry, so
+/// `expire_reservation` can return its units to `Available`. ~30 days.
+pub const RESERVATION_EXPIRY_GRACE_LEDGERS: u32 = 518_400;
+
+pub fn extend_instance_ttl(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+}
+
+/// Extend a persistent index/history entry when it exists. Full-scan reads call
+/// this so pages that are never written again stay live while still being read.
+/// Skips missing keys because `extend_ttl` traps on an absent entry.
+pub fn extend_page_ttl(env: &Env, key: &DataKey) {
+    if env.storage().persistent().has(key) {
+        env.storage()
+            .persistent()
+            .extend_ttl(key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+}
+
 /// Maximum history entries per storage page. Keeps each page small so
 /// a single read never loads the entire history of a high-traffic unit.
 const HISTORY_PAGE_SIZE: u32 = 50;
@@ -33,14 +54,18 @@ const INDEX_PAGE_SIZE: u32 = 20;
 // ── Admin ──────────────────────────────────────────────────────────────────────
 
 pub fn get_admin(env: &Env) -> Address {
-    env.storage()
+    let admin = env
+        .storage()
         .instance()
         .get(&DataKey::Admin)
-        .expect("Admin not initialized")
+        .expect("Admin not initialized");
+    extend_instance_ttl(env);
+    admin
 }
 
 pub fn set_admin(env: &Env, admin: &Address) {
     env.storage().instance().set(&DataKey::Admin, admin);
+    extend_instance_ttl(env);
 }
 
 // ── Authorization ──────────────────────────────────────────────────────────────
@@ -66,10 +91,13 @@ pub fn set_authorized_bank(env: &Env, bank: &Address, authorized: bool) {
 // ── Blood unit counter ─────────────────────────────────────────────────────────
 
 pub fn get_blood_unit_counter(env: &Env) -> u64 {
-    env.storage()
+    let counter = env
+        .storage()
         .instance()
         .get(&DataKey::BloodUnitCounter)
-        .unwrap_or(0)
+        .unwrap_or(0);
+    extend_instance_ttl(env);
+    counter
 }
 
 pub fn increment_blood_unit_id(env: &Env) -> u64 {
@@ -77,6 +105,7 @@ pub fn increment_blood_unit_id(env: &Env) -> u64 {
     env.storage()
         .instance()
         .set(&DataKey::BloodUnitCounter, &next_id);
+    extend_instance_ttl(env);
     next_id
 }
 
@@ -107,14 +136,14 @@ pub fn blood_unit_exists(env: &Env, id: u64) -> bool {
 pub fn add_to_blood_type_index(env: &Env, blood_unit: &BloodUnit) {
     let meta_key = DataKey::BloodTypeIndexMeta(blood_unit.blood_type);
     let current_page: u32 = env.storage().persistent().get(&meta_key).unwrap_or(0);
-    
+
     let page_key = DataKey::BloodTypeIndexPage(blood_unit.blood_type, current_page);
     let mut page: Vec<u64> = env
         .storage()
         .persistent()
         .get(&page_key)
         .unwrap_or(Vec::new(env));
-    
+
     if page.len() >= INDEX_PAGE_SIZE {
         // Current page is full — start a new one
         let next_page = current_page + 1;
@@ -122,7 +151,7 @@ pub fn add_to_blood_type_index(env: &Env, blood_unit: &BloodUnit) {
         env.storage()
             .persistent()
             .extend_ttl(&meta_key, TTL_THRESHOLD, TTL_EXTEND_TO);
-        
+
         let new_page_key = DataKey::BloodTypeIndexPage(blood_unit.blood_type, next_page);
         let mut new_page: Vec<u64> = Vec::new(env);
         new_page.push_back(blood_unit.id);
@@ -142,14 +171,14 @@ pub fn add_to_blood_type_index(env: &Env, blood_unit: &BloodUnit) {
 pub fn add_to_bank_index(env: &Env, blood_unit: &BloodUnit) {
     let meta_key = DataKey::BankIndexMeta(blood_unit.bank_id.clone());
     let current_page: u32 = env.storage().persistent().get(&meta_key).unwrap_or(0);
-    
+
     let page_key = DataKey::BankIndexPage(blood_unit.bank_id.clone(), current_page);
     let mut page: Vec<u64> = env
         .storage()
         .persistent()
         .get(&page_key)
         .unwrap_or(Vec::new(env));
-    
+
     if page.len() >= INDEX_PAGE_SIZE {
         // Current page is full — start a new one
         let next_page = current_page + 1;
@@ -157,7 +186,7 @@ pub fn add_to_bank_index(env: &Env, blood_unit: &BloodUnit) {
         env.storage()
             .persistent()
             .extend_ttl(&meta_key, TTL_THRESHOLD, TTL_EXTEND_TO);
-        
+
         let new_page_key = DataKey::BankIndexPage(blood_unit.bank_id.clone(), next_page);
         let mut new_page: Vec<u64> = Vec::new(env);
         new_page.push_back(blood_unit.id);
@@ -177,14 +206,14 @@ pub fn add_to_bank_index(env: &Env, blood_unit: &BloodUnit) {
 pub fn add_to_status_index(env: &Env, blood_unit: &BloodUnit) {
     let meta_key = DataKey::StatusIndexMeta(blood_unit.status);
     let current_page: u32 = env.storage().persistent().get(&meta_key).unwrap_or(0);
-    
+
     let page_key = DataKey::StatusIndexPage(blood_unit.status, current_page);
     let mut page: Vec<u64> = env
         .storage()
         .persistent()
         .get(&page_key)
         .unwrap_or(Vec::new(env));
-    
+
     if page.len() >= INDEX_PAGE_SIZE {
         // Current page is full — start a new one
         let next_page = current_page + 1;
@@ -192,7 +221,7 @@ pub fn add_to_status_index(env: &Env, blood_unit: &BloodUnit) {
         env.storage()
             .persistent()
             .extend_ttl(&meta_key, TTL_THRESHOLD, TTL_EXTEND_TO);
-        
+
         let new_page_key = DataKey::StatusIndexPage(blood_unit.status, next_page);
         let mut new_page: Vec<u64> = Vec::new(env);
         new_page.push_back(blood_unit.id);
@@ -200,21 +229,65 @@ pub fn add_to_status_index(env: &Env, blood_unit: &BloodUnit) {
         env.storage()
             .persistent()
             .extend_ttl(&new_page_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        set_status_index_slot(env, blood_unit.id, next_page, 0);
     } else {
+        let slot = page.len();
         page.push_back(blood_unit.id);
         env.storage().persistent().set(&page_key, &page);
         env.storage()
             .persistent()
             .extend_ttl(&page_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        set_status_index_slot(env, blood_unit.id, current_page, slot);
     }
 }
 
-/// Remove a single ID from a status index bucket.
-/// Scans all pages until the ID is found, rebuilds that page without it.
+fn set_status_index_slot(env: &Env, blood_unit_id: u64, page: u32, slot: u32) {
+    let slot_key = DataKey::StatusIndexSlot(blood_unit_id);
+    env.storage().persistent().set(&slot_key, &(page, slot));
+    env.storage()
+        .persistent()
+        .extend_ttl(&slot_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+}
+
+/// Remove a single ID from a status index bucket in O(1) reads.
+/// The unit's (page, slot) position is looked up directly and the hole is
+/// filled by swap-removing the page's last element.
+/// Units indexed before positions were tracked fall back to a page scan.
 pub fn remove_from_status_index(env: &Env, blood_unit_id: u64, old_status: BloodStatus) {
+    let slot_key = DataKey::StatusIndexSlot(blood_unit_id);
+    let (page, slot): (u32, u32) = match env.storage().persistent().get(&slot_key) {
+        Some(position) => position,
+        None => return remove_from_status_index_scan(env, blood_unit_id, old_status),
+    };
+
+    let page_key = DataKey::StatusIndexPage(old_status, page);
+    let mut units: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&page_key)
+        .unwrap_or(Vec::new(env));
+
+    let last_slot = units.len() - 1;
+    if slot != last_slot {
+        let moved_id = units.get(last_slot).unwrap();
+        units.set(slot, moved_id);
+        set_status_index_slot(env, moved_id, page, slot);
+    }
+    units.pop_back();
+
+    env.storage().persistent().set(&page_key, &units);
+    env.storage()
+        .persistent()
+        .extend_ttl(&page_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    env.storage().persistent().remove(&slot_key);
+}
+
+/// Legacy removal for units with no recorded slot: scans all pages from 0.
+fn remove_from_status_index_scan(env: &Env, blood_unit_id: u64, old_status: BloodStatus) {
     let meta_key = DataKey::StatusIndexMeta(old_status);
     let last_page: u32 = env.storage().persistent().get(&meta_key).unwrap_or(0);
-    
+    extend_page_ttl(env, &meta_key);
+
     for p in 0..=last_page {
         let page_key = DataKey::StatusIndexPage(old_status, p);
         let units: Vec<u64> = env
@@ -222,7 +295,8 @@ pub fn remove_from_status_index(env: &Env, blood_unit_id: u64, old_status: Blood
             .persistent()
             .get(&page_key)
             .unwrap_or(Vec::new(env));
-        
+        extend_page_ttl(env, &page_key);
+
         let mut updated: Vec<u64> = Vec::new(env);
         let mut found = false;
         for i in 0..units.len() {
@@ -233,7 +307,7 @@ pub fn remove_from_status_index(env: &Env, blood_unit_id: u64, old_status: Blood
                 found = true;
             }
         }
-        
+
         if found {
             env.storage().persistent().set(&page_key, &updated);
             env.storage()
@@ -248,14 +322,14 @@ pub fn add_to_donor_index(env: &Env, blood_unit: &BloodUnit) {
     if let Some(donor) = &blood_unit.donor_id {
         let meta_key = DataKey::DonorIndexMeta(donor.clone());
         let current_page: u32 = env.storage().persistent().get(&meta_key).unwrap_or(0);
-        
+
         let page_key = DataKey::DonorIndexPage(donor.clone(), current_page);
         let mut page: Vec<u64> = env
             .storage()
             .persistent()
             .get(&page_key)
             .unwrap_or(Vec::new(env));
-        
+
         if page.len() >= INDEX_PAGE_SIZE {
             // Current page is full — start a new one
             let next_page = current_page + 1;
@@ -263,7 +337,7 @@ pub fn add_to_donor_index(env: &Env, blood_unit: &BloodUnit) {
             env.storage()
                 .persistent()
                 .extend_ttl(&meta_key, TTL_THRESHOLD, TTL_EXTEND_TO);
-            
+
             let new_page_key = DataKey::DonorIndexPage(donor.clone(), next_page);
             let mut new_page: Vec<u64> = Vec::new(env);
             new_page.push_back(blood_unit.id);
@@ -360,6 +434,7 @@ pub fn record_status_change(
 pub fn get_status_history(env: &Env, blood_unit_id: u64) -> Vec<StatusChangeHistory> {
     let page_key = DataKey::StatusHistory(blood_unit_id);
     let last_page: u32 = env.storage().persistent().get(&page_key).unwrap_or(0);
+    extend_page_ttl(env, &page_key);
 
     let mut all: Vec<StatusChangeHistory> = Vec::new(env);
     for p in 0..=last_page {
@@ -369,6 +444,7 @@ pub fn get_status_history(env: &Env, blood_unit_id: u64) -> Vec<StatusChangeHist
             .persistent()
             .get(&page_data_key)
             .unwrap_or(Vec::new(env));
+        extend_page_ttl(env, &page_data_key);
         for i in 0..page.len() {
             all.push_back(page.get(i).unwrap());
         }
@@ -407,6 +483,7 @@ fn increment_status_history_counter(env: &Env) -> u64 {
     let current: u64 = env.storage().instance().get(&key).unwrap_or(0u64);
     let next_id = current + 1;
     env.storage().instance().set(&key, &next_id);
+    extend_instance_ttl(env);
     next_id
 }
 
@@ -417,24 +494,24 @@ pub fn increment_reservation_id(env: &Env) -> u64 {
     let current: u64 = env.storage().instance().get(&key).unwrap_or(0);
     let next_id = current + 1;
     env.storage().instance().set(&key, &next_id);
+    extend_instance_ttl(env);
     next_id
 }
 
-/// Store a reservation in temporary storage and extend its TTL to cover `duration_seconds`.
+/// Store a reservation in persistent storage and extend its TTL to cover
+/// `duration_seconds` plus a grace period.
+///
+/// # Why persistent storage
+/// Temporary entries are deleted permanently once their TTL lapses. If a reservation
+/// were purged, its unit IDs would be unrecoverable and the units would stay stuck in
+/// `Reserved` forever. Persistent entries survive past expiry, so `expire_reservation`
+/// can still find them and return the units to `Available`.
 ///
 /// # Why we extend TTL here
-/// Soroban temporary-storage entries are assigned a network-default TTL at creation
-/// time (currently ~1 ledger on testnet, a few ledgers on mainnet). That default is
-/// far shorter than the maximum reservation duration (7 days). Without an explicit
-/// bump the entry would be archived/purged long before it logically expires, causing
-/// `get_reservation` to return `None` and leaving all reserved units permanently
-/// stuck in `Reserved` status with no automated recovery path.
-///
-/// We convert `duration_seconds` to ledgers (ceiling division, rounding up) and
-/// apply a small safety buffer (`RESERVATION_TTL_BUFFER_LEDGERS`) so that the entry
-/// is still readable at the exact moment `expiration_timestamp` is reached.
-/// The threshold is set to the same value so the entry is bumped unconditionally
-/// (i.e., `extend_ttl` always sets the TTL to `ttl_ledgers`).
+/// The TTL covers the full reservation duration plus `RESERVATION_EXPIRY_GRACE_LEDGERS`
+/// so the entry is still readable after `expiration_timestamp` long enough for anyone
+/// to call `expire_reservation`. The threshold is set to the same value so the entry is
+/// bumped unconditionally (i.e., `extend_ttl` always sets the TTL to `ttl_ledgers`).
 pub fn set_reservation(
     env: &Env,
     id: u64,
@@ -442,29 +519,26 @@ pub fn set_reservation(
     duration_seconds: u64,
 ) {
     let key = DataKey::Reservation(id);
-    env.storage().temporary().set(&key, reservation);
+    env.storage().persistent().set(&key, reservation);
 
     // Convert duration to ledgers (ceiling division so we never under-extend).
-    // Add a small buffer so the entry remains readable at the exact expiry instant.
-    const BUFFER_LEDGERS: u32 = 120; // ~10 minutes of headroom
-    let duration_ledgers = (duration_seconds
-        .saturating_add(LEDGER_CLOSE_SECS - 1)
-        / LEDGER_CLOSE_SECS) as u32;
+    let duration_ledgers =
+        (duration_seconds.saturating_add(LEDGER_CLOSE_SECS - 1) / LEDGER_CLOSE_SECS) as u32;
     let ttl_ledgers = duration_ledgers
-        .saturating_add(BUFFER_LEDGERS)
+        .saturating_add(RESERVATION_EXPIRY_GRACE_LEDGERS)
         .max(RESERVATION_TTL_MIN_LEDGERS);
 
     // threshold == ttl_ledgers forces an unconditional bump regardless of the
     // current remaining TTL (which is unknown / network-default at creation).
     env.storage()
-        .temporary()
+        .persistent()
         .extend_ttl(&key, ttl_ledgers, ttl_ledgers);
 }
 
 pub fn get_reservation(env: &Env, id: u64) -> Option<crate::types::Reservation> {
-    env.storage().temporary().get(&DataKey::Reservation(id))
+    env.storage().persistent().get(&DataKey::Reservation(id))
 }
 
 pub fn remove_reservation(env: &Env, id: u64) {
-    env.storage().temporary().remove(&DataKey::Reservation(id));
+    env.storage().persistent().remove(&DataKey::Reservation(id));
 }

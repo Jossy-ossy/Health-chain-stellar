@@ -38,6 +38,9 @@ use inventory_client::InventoryContractClient;
 
 const CONTRACT_VERSION: u32 = 1;
 
+/// Inventory's `ContractError::ReservationNotFound` discriminant.
+const INVENTORY_RESERVATION_NOT_FOUND: u32 = 150;
+
 /// Maximum number of entries accepted by `batch_create_requests`.
 /// Mirrors the sibling matching contract's `MAX_BATCH_SIZE` so callers hit a
 /// dedicated error instead of the instruction or storage-write limit.
@@ -100,7 +103,15 @@ impl RequestContract {
             // Use cross-contract authorization: the requests contract itself is
             // the authorized intermediary. The inventory contract verifies that
             // this function is called FROM the requests contract address.
-            inv_client.release_reservation_by_contract(&requests_contract, &res_id);
+            // A reservation that was already expired via `expire_reservation` has
+            // nothing left to release, so `ReservationNotFound` counts as released
+            // and the cancellation/rejection still goes through.
+            let not_found = soroban_sdk::Error::from_contract_error(INVENTORY_RESERVATION_NOT_FOUND);
+            match inv_client.try_release_reservation_by_contract(&requests_contract, &res_id) {
+                Ok(Ok(())) => {}
+                Err(Ok(err)) if err == not_found => {}
+                _ => panic!("inventory reservation release failed"),
+            }
             request.reservation_id = None;
             true
         } else {
@@ -125,6 +136,7 @@ impl RequestContract {
         storage::set_metadata(&env, &storage::default_metadata(&env));
         storage::authorize_hospital(&env, &admin);
         storage::set_initialized(&env);
+        storage::bump_instance_ttl(&env);
 
         events::emit_initialized(&env, &admin, &inventory_contract);
 
@@ -174,6 +186,26 @@ impl RequestContract {
         storage::require_initialized(&env)?;
         storage::get_admin(&env).require_auth();
         storage::revoke_rider(&env, &rider);
+        Ok(())
+    }
+
+    /// Assign the authorized rider that is allowed to pick up an Approved request.
+    /// Admin only. May be called again to reassign before pickup.
+    pub fn assign_rider(env: Env, request_id: u64, rider: Address) -> Result<(), ContractError> {
+        storage::require_initialized(&env)?;
+        storage::get_admin(&env).require_auth();
+
+        if !storage::is_rider_authorized(&env, &rider) {
+            return Err(ContractError::NotAuthorizedRider);
+        }
+
+        let request =
+            storage::get_request(&env, request_id).ok_or(ContractError::RequestNotFound)?;
+        if request.status != RequestStatus::Approved {
+            return Err(ContractError::InvalidRequestStatus);
+        }
+
+        storage::set_request_rider(&env, request_id, &rider);
         Ok(())
     }
 
@@ -322,6 +354,68 @@ impl RequestContract {
             return Err(ContractError::NotRequestOwner);
         }
 
+        // Units in an InProgress request are already on a rider's vehicle;
+        // cancelling would release their reservation while they are in transit.
+        if request.status == RequestStatus::InProgress {
+            return Err(ContractError::InvalidRequestStatus);
+        }
+
+        Self::cancel_internal(&env, &mut request, &caller, reason)
+    }
+
+    /// Configure the payments contract trusted to cancel requests via
+    /// `cancel_request_by_contract`. Admin only; may be called again to rotate.
+    pub fn set_payments_contract(
+        env: Env,
+        payments_contract: Address,
+    ) -> Result<(), ContractError> {
+        storage::require_initialized(&env)?;
+        storage::get_admin(&env).require_auth();
+        storage::set_payments_contract(&env, &payments_contract);
+        events::emit_payments_contract_set(&env, &payments_contract);
+        Ok(())
+    }
+
+    pub fn get_payments_contract(env: Env) -> Result<Option<Address>, ContractError> {
+        storage::require_initialized(&env)?;
+        Ok(storage::get_payments_contract(&env))
+    }
+
+    /// Cancel a blood request on behalf of the trusted payments contract
+    /// (e.g. after an expired dispute is auto-refunded).
+    ///
+    /// Mirrors inventory's `release_reservation_by_contract`: `caller_contract`
+    /// must authorize the call (automatic for the direct invoking contract) and
+    /// must equal the payments contract configured via `set_payments_contract`.
+    pub fn cancel_request_by_contract(
+        env: Env,
+        caller_contract: Address,
+        request_id: u64,
+        reason: String,
+    ) -> Result<(), ContractError> {
+        storage::require_initialized(&env)?;
+        caller_contract.require_auth();
+
+        match storage::get_payments_contract(&env) {
+            Some(ref trusted) if *trusted == caller_contract => {}
+            Some(_) => return Err(ContractError::Unauthorized),
+            None => return Err(ContractError::PaymentsContractNotSet),
+        }
+
+        Self::ensure_non_empty_reason(&reason)?;
+
+        let mut request =
+            storage::get_request(&env, request_id).ok_or(ContractError::RequestNotFound)?;
+
+        Self::cancel_internal(&env, &mut request, &caller_contract, reason)
+    }
+
+    fn cancel_internal(
+        env: &Env,
+        request: &mut BloodRequest,
+        actor: &Address,
+        reason: String,
+    ) -> Result<(), ContractError> {
         match request.status {
             RequestStatus::Pending | RequestStatus::Approved | RequestStatus::InProgress => {}
             _ => return Err(ContractError::InvalidRequestStatus),
@@ -329,11 +423,11 @@ impl RequestContract {
 
         let old_status = request.status;
         request.status = RequestStatus::Cancelled;
-        let released_reservation = Self::release_reservation_if_present(&env, &mut request);
+        let released_reservation = Self::release_reservation_if_present(env, request);
         Self::append_history(
-            &env,
-            &mut request,
-            &caller,
+            env,
+            request,
+            actor,
             old_status,
             false,
             RequestStatus::Cancelled,
@@ -341,9 +435,10 @@ impl RequestContract {
             0,
             released_reservation,
         );
-        storage::set_request(&env, &request);
+        storage::set_request(env, request);
+        storage::remove_from_hospital_requests(env, &request.hospital_id, request.id);
 
-        events::emit_request_cancelled(&env, request_id, &caller, env.ledger().timestamp());
+        events::emit_request_cancelled(env, request.id, actor, env.ledger().timestamp());
 
         Ok(())
     }
@@ -361,12 +456,22 @@ impl RequestContract {
         storage::require_initialized(&env)?;
 
         let admin = storage::get_admin(&env);
-        if caller != admin {
+        let is_admin = caller == admin;
+        let is_authorized_rider = storage::is_rider_authorized(&env, &caller);
+
+        // Authorized riders may only drive the Approved → InProgress transition (pickup);
+        // all other transitions remain admin-only.
+        if !(is_admin || (new_status == RequestStatus::InProgress && is_authorized_rider)) {
             return Err(ContractError::Unauthorized);
         }
 
         let mut request =
             storage::get_request(&env, request_id).ok_or(ContractError::RequestNotFound)?;
+
+        // A rider may only pick up a request the admin assigned to it.
+        if !is_admin && storage::get_request_rider(&env, request_id) != Some(caller.clone()) {
+            return Err(ContractError::Unauthorized);
+        }
 
         if request.status == new_status {
             return Err(ContractError::InvalidRequestStatus);
@@ -382,7 +487,7 @@ impl RequestContract {
         let mut fulfilled_delta_ml = 0;
 
         match new_status {
-            RequestStatus::Approved => {}
+            RequestStatus::Approved | RequestStatus::InProgress => {}
             RequestStatus::Rejected => {
                 Self::ensure_non_empty_reason(&reason)?;
                 released_reservation = Self::release_reservation_if_present(&env, &mut request);
@@ -394,7 +499,7 @@ impl RequestContract {
                 fulfilled_delta_ml = remaining;
                 request.fulfilled_quantity_ml = request.quantity_ml;
             }
-            RequestStatus::InProgress | RequestStatus::Pending | RequestStatus::Cancelled => {
+            RequestStatus::Pending | RequestStatus::Cancelled => {
                 return Err(ContractError::InvalidRequestStatus);
             }
         }
@@ -412,6 +517,12 @@ impl RequestContract {
             released_reservation,
         );
         storage::set_request(&env, &request);
+        if matches!(
+            new_status,
+            RequestStatus::Rejected | RequestStatus::Fulfilled
+        ) {
+            storage::remove_from_hospital_requests(&env, &request.hospital_id, request_id);
+        }
 
         events::emit_request_status_updated(
             &env,
@@ -478,6 +589,9 @@ impl RequestContract {
             false,
         );
         storage::set_request(&env, &request);
+        if new_status == RequestStatus::Fulfilled {
+            storage::remove_from_hospital_requests(&env, &request.hospital_id, request_id);
+        }
 
         events::emit_request_status_updated(
             &env,
@@ -572,8 +686,38 @@ impl RequestContract {
 
         let mut request =
             storage::get_request(&env, request_id).ok_or(ContractError::RequestNotFound)?;
-        request.fulfilled_by = Some(org_id);
+
+        match request.status {
+            RequestStatus::Approved | RequestStatus::InProgress => {}
+            _ => return Err(ContractError::InvalidRequestStatus),
+        }
+
+        if request.fulfilled_by.is_some() {
+            return Err(ContractError::FulfillingOrgAlreadySet);
+        }
+
+        request.fulfilled_by = Some(org_id.clone());
+        let status = request.status;
+        Self::append_history(
+            &env,
+            &mut request,
+            &caller,
+            status,
+            false,
+            status,
+            String::from_str(&env, "Fulfilling org set"),
+            0,
+            false,
+        );
         storage::set_request(&env, &request);
+
+        events::emit_fulfilling_org_set(
+            &env,
+            request_id,
+            &caller,
+            &org_id,
+            env.ledger().timestamp(),
+        );
 
         Ok(())
     }
@@ -618,18 +762,17 @@ impl RequestContract {
         page_size: u32,
     ) -> Result<soroban_sdk::Vec<BloodRequest>, ContractError> {
         storage::require_initialized(&env)?;
-        let page_size = page_size.min(50) as usize;
+        let page_size = page_size.min(50);
         let request_ids = storage::get_hospital_request_ids(&env, &hospital_id);
-        let start = (page as usize).saturating_mul(page_size);
-        let end = (start + page_size).min(request_ids.len());
+        let total = request_ids.len();
+        let start = page.saturating_mul(page_size).min(total);
+        let end = start.saturating_add(page_size).min(total);
 
         let mut results: soroban_sdk::Vec<BloodRequest> = soroban_sdk::Vec::new(&env);
-        if start < request_ids.len() {
-            for i in start..end {
-                let id = request_ids.get(i).unwrap();
-                if let Some(req) = storage::get_request(&env, id) {
-                    results.push_back(req);
-                }
+        for i in start..end {
+            let id = request_ids.get(i).unwrap();
+            if let Some(req) = storage::get_request(&env, id) {
+                results.push_back(req);
             }
         }
         Ok(results)
